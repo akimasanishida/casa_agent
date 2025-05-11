@@ -12,3 +12,5 @@ wheels/
 # Test files
 /test_dir/
 /.env
+*.log
+*.last

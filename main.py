@@ -1,9 +1,13 @@
+import asyncio
+import json
 import os
 import subprocess
 
-from agents import Agent, FileSearchTool, Runner, function_tool
+from agents import (Agent, FileSearchTool, MaxTurnsExceeded, Runner,
+                    function_tool)
 from dotenv import load_dotenv
 from openai.types.responses import ResponseTextDeltaEvent
+from prompt_toolkit import PromptSession
 
 
 @function_tool
@@ -18,9 +22,34 @@ def exec_command(container_name: str, command: str) -> str:
     Returns:
         str: The STDOUT and STDERR of the command.
     """
-    print(f"\n\n\tCommand: {command}\n\n")
+    print(f"\n\tCommand: {command}\n")
     try:
         cmd = ["podman", "exec", "-i", container_name, "bash", "-c", command]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        output = f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        return output
+    except subprocess.CalledProcessError as e:
+        return f"Error executing command: {e}"
+
+
+@function_tool
+def write_file(container_name: str, mode: str, file_path: str, content: str) -> str:
+    """
+    Write to a file in the container.
+
+    Args:
+        container_name (str): The name of the container.
+        mode (str): The mode of the file operation. "w" for write, "a" for append.
+        file_path (str): The path to the file.
+        content (str): The content to write to the file (only used in 'write' mode).
+    """
+    mode_str = "write" if mode == "w" else "append"
+    print(
+        f'\n\tWrite to file "{file_path}" as mode "{mode_str}"\nContent:\n{content}\n'
+    )
+    try:
+        python_cmd = f"with open({json.dumps(file_path)}, {json.dumps(mode)}) as f: f.write({json.dumps(content)})"
+        cmd = ["podman", "exec", "-i", container_name, "python", "-c", python_cmd]
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         output = f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
         return output
@@ -32,7 +61,7 @@ class CasaAgents:
     def __init__(self):
         self._casa_dir = "/usr/local/casa/casa-6.6.1-17-pipeline-2024.1.0.8/"
         self._podman_path = "podman"
-        self._image_name = "python:3.13-slim"
+        self._image_name = "casa-skeleton-python"
         self._analysisUtils_dir = "/home/skrbcr/analysis_scripts/"
 
         # Check if podman is installed
@@ -73,6 +102,19 @@ class CasaAgents:
             # Give the container a name
             "--name",
             self._container_name,
+            # Use X11
+            "-e",
+            f"DISPLAY={os.environ['DISPLAY']}",
+            "-e",
+            "QT_X11_NO_MITSHM=1",
+            "-v",
+            "/tmp/.X11-unix:/tmp/.X11-unix",
+            # Use FUSE
+            "--device",
+            "/dev/fuse",
+            "--cap-add=SYS_ADMIN",
+            "--security-opt",
+            "label=disable",
             # Mount the working directory as read-write
             "-v",
             "./test_dir:/working:rw",  # For testing
@@ -97,8 +139,8 @@ class CasaAgents:
 
         try:
             subprocess.run(cmd, capture_output=True, text=True, check=True)
-        except subprocess.CalledProcessError:
-            raise RuntimeError(f"Cannot create container {self._container_name}.")
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Cannot create container {self._container_name}.\n{e}")
 
         with open("./systemPrompt.md", "r") as f:
             system_prompt = f.read()
@@ -114,12 +156,40 @@ class CasaAgents:
             + f"You can operate the command by calling exec_command and the container name is {self._container_name}. You can use common commands in this bash. The path of Python is `python`. The path of CASA is `/opt/casa/bin/casa`. analysisUtils is `/opt/analysisUtils`.",
             tools=[
                 exec_command,
+                write_file,
                 FileSearchTool(
                     vector_store_ids=[vector_store_id],
                 ),
             ],
         )
         self._previous_response_id = None
+
+        self._session = PromptSession()
+
+    async def _run_loop(self) -> None:
+        while True:
+            prompt = await self._session.prompt_async("> ")
+
+            cmd = prompt.strip().lower()
+            if cmd in ["exit", "quit", "q"]:
+                break
+
+            # Run the agent
+            try:
+                result = await Runner.run(
+                    self._agent,
+                    input=prompt,
+                    previous_response_id=self._previous_response_id,
+                    max_turns=50,
+                )
+
+                self._previous_response_id = result.last_response_id
+                reply = result.final_output
+                print(f"Agent: {reply}")
+            except MaxTurnsExceeded as _:
+                print(
+                    f"The agent has exceeded the maximum number of turns.\nIf you want to continue, please tell me."
+                )
 
     def run(self) -> None:
         """
@@ -131,25 +201,7 @@ class CasaAgents:
         Returns:
             None
         """
-        while True:
-            prompt = input("> ")
-            if (
-                prompt.lower() == "exit"
-                or prompt.lower() == "quit"
-                or prompt.lower() == "q"
-            ):
-                break
-            # Run the agent
-            result = Runner.run_sync(
-                self._agent,
-                input=prompt,
-                previous_response_id=self._previous_response_id,
-            )
-
-            # Append the agent's response to the history
-            self._previous_response_id = result.last_response_id
-            reply = result.final_output
-            print(f"Agent: {reply}")
+        asyncio.run(self._run_loop())
 
     def close(self):
         """
@@ -163,11 +215,11 @@ class CasaAgents:
             print(f"Cannot stop container {self._container_name}.")
 
         # Clean up the container
-        # cmd = ["podman", "rm", "-f", self._container_name]
-        # try:
-        #     subprocess.run(cmd, capture_output=True, text=True, check=True)
-        # except subprocess.CalledProcessError:
-        #     print(f"Cannot remove container {self._container_name}.")
+        cmd = ["podman", "rm", "-f", self._container_name]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError:
+            print(f"Cannot remove container {self._container_name}.")
 
 
 if __name__ == "__main__":
