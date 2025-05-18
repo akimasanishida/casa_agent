@@ -2,29 +2,34 @@ import asyncio
 import json
 import os
 import subprocess
+import tomllib
 
-from agents import (Agent, FileSearchTool, MaxTurnsExceeded, Runner,
-                    function_tool)
+from agents import Agent, FileSearchTool, MaxTurnsExceeded, Runner, function_tool
 from dotenv import load_dotenv
 from openai.types.responses import ResponseTextDeltaEvent
 from prompt_toolkit import PromptSession
 
+CONTAINER_NAME: str | None = None
+
 
 @function_tool
-def exec_command(container_name: str, command: str) -> str:
+def exec_command(command: str) -> str:
     """
     Execute a shell command in the container.
 
     Args:
-        container_name (str): The name of the container.
         command (str): The command to execute.
 
     Returns:
         str: The STDOUT and STDERR of the command.
     """
+    if CONTAINER_NAME is None:
+        raise ValueError(
+            "Container name is not set. Please set it before using this function."
+        )
     print(f"\n\tCommand: {command}\n")
     try:
-        cmd = ["podman", "exec", "-i", container_name, "bash", "-c", command]
+        cmd = ["podman", "exec", "-i", CONTAINER_NAME, "bash", "-c", command]
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         output = f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
         return output
@@ -33,23 +38,26 @@ def exec_command(container_name: str, command: str) -> str:
 
 
 @function_tool
-def write_file(container_name: str, mode: str, file_path: str, content: str) -> str:
+def write_file(mode: str, file_path: str, content: str) -> str:
     """
     Write to a file in the container.
 
     Args:
-        container_name (str): The name of the container.
         mode (str): The mode of the file operation. "w" for write, "a" for append.
         file_path (str): The path to the file.
         content (str): The content to write to the file (only used in 'write' mode).
     """
+    if CONTAINER_NAME is None:
+        raise ValueError(
+            "Container name is not set. Please set it before using this function."
+        )
     mode_str = "write" if mode == "w" else "append"
     print(
         f'\n\tWrite to file "{file_path}" as mode "{mode_str}"\nContent:\n{content}\n'
     )
     try:
         python_cmd = f"with open({json.dumps(file_path)}, {json.dumps(mode)}) as f: f.write({json.dumps(content)})"
-        cmd = ["podman", "exec", "-i", container_name, "python", "-c", python_cmd]
+        cmd = ["podman", "exec", "-i", CONTAINER_NAME, "python", "-c", python_cmd]
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         output = f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
         return output
@@ -61,7 +69,7 @@ class CasaAgents:
     def __init__(self):
         self._casa_dir = "/usr/local/casa/casa-6.6.1-17-pipeline-2024.1.0.8/"
         self._podman_path = "podman"
-        self._image_name = "casa-skeleton-python"
+        self._image_name = "casa-skeleton-python:latest"
         self._analysisUtils_dir = "/home/skrbcr/analysis_scripts/"
 
         # Check if podman is installed
@@ -93,6 +101,8 @@ class CasaAgents:
 
         # Set the container name
         self._container_name = "casa-agent-" + os.urandom(4).hex()
+        global CONTAINER_NAME
+        CONTAINER_NAME = self._container_name
 
         # Create a new containe
         cmd = [
@@ -142,18 +152,18 @@ class CasaAgents:
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Cannot create container {self._container_name}.\n{e}")
 
-        with open("./systemPrompt.md", "r") as f:
-            system_prompt = f.read()
+        with open("./system.toml", "rb") as f:
+            data = tomllib.load(f)
+            system_prompt_agent = str(data["systemPrompt"]["agent"])
 
         load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
         vector_store_id = os.environ.get("VECTOR_STORE_ID")
 
         # Initialize the agent
         self._agent = Agent(
-            name="casa-agent",
+            name="CASA Agent",
             model="gpt-4.1",
-            instructions=system_prompt
-            + f"You can operate the command by calling exec_command and the container name is {self._container_name}. You can use common commands in this bash. The path of Python is `python`. The path of CASA is `/opt/casa/bin/casa`. analysisUtils is `/opt/analysisUtils`.",
+            instructions=system_prompt_agent,
             tools=[
                 exec_command,
                 write_file,
@@ -162,6 +172,7 @@ class CasaAgents:
                 ),
             ],
         )
+
         self._previous_response_id = None
 
         self._session = PromptSession()
@@ -185,7 +196,7 @@ class CasaAgents:
 
                 self._previous_response_id = result.last_response_id
                 reply = result.final_output
-                print(f"Agent: {reply}")
+                print(f"Agent:\n{reply}")
             except MaxTurnsExceeded as _:
                 print(
                     f"The agent has exceeded the maximum number of turns.\nIf you want to continue, please tell me."
@@ -224,7 +235,5 @@ class CasaAgents:
 
 if __name__ == "__main__":
     agent = CasaAgents()
-    # prompt = "現在のディクトリにあるmeasurement set とそのサイズをGB で表示してください。"
-    # prompt = "CASA のバージョンを表示してください。"
     agent.run()
     agent.close()
